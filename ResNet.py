@@ -47,7 +47,7 @@ class ResNet(nn.HybridBlock):
             # block 5
             net.add(nn.AvgPool2D(pool_size=8))
             net.add(nn.Flatten())
-            net.add(nn.Dense(num_classes))
+            net.add(nn.Dense(num_classes, activation='sigmoid'))
 
     def hybrid_forward(self, F, x):
         out = x

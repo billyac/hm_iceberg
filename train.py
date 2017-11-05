@@ -1,17 +1,18 @@
 import datetime
-import os
 
 import numpy as np
 import pandas as pd
 from mxnet import autograd
 from mxnet import gluon
 from mxnet import nd
+from mxnet import image
 from sklearn.model_selection import train_test_split
 
 import ResNet
 import utils
 
-base_path = os.path.join('..', 'data')
+
+batch_size = 128
 
 
 def train(net, train_data, valid_data, num_epochs, lr, wd, ctx, lr_period, lr_decay):
@@ -50,39 +51,58 @@ def train(net, train_data, valid_data, num_epochs, lr, wd, ctx, lr_period, lr_de
         print(epoch_str + time_str + ', lr ' + str(trainer.learning_rate))
 
 
-def load_and_format(in_path):
-    out_df = pd.read_json(in_path)
-    out_df['inc_angle'].replace('na', np.nan, inplace=True)
-    out_images = out_df.apply(lambda c_row: [np.stack([c_row['band_1'], c_row['band_2']], -1).reshape((75, 75, 2))], 1)
-    out_images = np.stack(out_images).squeeze()
-    return out_df, out_images
-
-
 if __name__ == '__main__':
     # Loss Function...
     softmax_cross_entropy = gluon.loss.SoftmaxCrossEntropyLoss()
 
+    # ########### Data Initialization ###########
     # Reading Data.....
-    train_df, train_images = load_and_format(os.path.join(base_path, 'train.json'))
-    print('training', train_df.shape, 'loaded', train_images.shape)
-    test_df, test_images = load_and_format(os.path.join(base_path, 'test.json'))
-    print('testing', test_df.shape, 'loaded', test_images.shape)
+    train = pd.read_json("../data/train.json")
+    test = pd.read_json("../data/test.json")
+    train.inc_angle = train.inc_angle.replace('na', 0)
+    train.inc_angle = train.inc_angle.astype(float).fillna(0.0)
+    print("Loading Data done!")
 
-    # Transpose from 75*75*2 -> 2*75*75
-    train_images = [nd.transpose(nd.array(train_images[x]),(2,0,1)) for x in range(len(train_df['is_iceberg']))]
-    test_images = [nd.transpose(nd.array(test_images[x]),(2,0,1)) for x in range(len(test_df['id']))]
+    # Train data
+    x_band1 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in train["band_1"]])
+    x_band2 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in train["band_2"]])
+    X_train = np.concatenate([x_band1[:, :, :, np.newaxis], x_band2[:, :, :, np.newaxis]
+                             , ((x_band1+x_band2)/2)[:, :, :, np.newaxis]], axis=-1)   # Create a third channel
+    X_angle_train = np.array(train.inc_angle)
+    y_train = np.array(train["is_iceberg"])
+
+    # Test data
+    x_band1 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in test["band_1"]])
+    x_band2 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in test["band_2"]])
+    X_test = np.concatenate([x_band1[:, :, :, np.newaxis], x_band2[:, :, :, np.newaxis]
+                             , ((x_band1+x_band2)/2)[:, :, :, np.newaxis]], axis=-1)
+    X_angle_test = np.array(test.inc_angle)
+
+    # ############# Augmentation #################
+    mean = nd.array([-20.655821, -26.320704, -23.488279])
+    std = nd.array([5.200841, 3.3955173, 3.8151529])
+    normalizer = image.ColorNormalizeAug(mean, std)
+    flip = image.HorizontalFlipAug(1)
+
+    X_train_new = [normalizer(nd.array(X_train[i])) for i in range(1604)]    # normalize
+    X_train_new.extend([flip(X_train_new[i]) for i in range(1604)])     # flip
+    y_train_new = np.append(y_train, y_train)  # y_train
+    X_test_new = [normalizer(nd.array(X_test[i])) for i in range(8424)]  # X_test
+
+    # Resize:
+    X_train_new = [nd.transpose(X_train_new[i], (2, 0, 1)) for i in range(len(X_train_new))]
+    X_test_new = [nd.transpose(X_test_new[i], (2, 0, 1)) for i in range(len(X_test_new))]
 
     # Train test split
-    X_train, X_test, y_train, y_test = train_test_split(train_images, np.asarray(train_df['is_iceberg']), test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X_train_new, y_train_new, test_size=0.2, random_state=66)
 
-    # Aggregated Data_Set vs label
+    # Aggregated Data_Set vs label, to pass to gluon data loader
     train_ds = [(X_train[i],y_train[i]) for i in range(len(y_train))]
     valid_ds = [(X_test[i],y_test[i]) for i in range(len(y_test))]
-    train_valid_ds = [(train_images[i], np.asarray(train_df['is_iceberg'][i])) for i in range(len(train_df['is_iceberg']))]
-    test_ds = [(test_images[i], 0) for i in range(len(test_df['id']))]
+    train_valid_ds = [(X_train_new[i], y_train_new[i]) for i in range(len(y_train_new))]
+    test_ds = [(X_test_new[i], 0) for i in range(len(X_test_new))]
 
     # Pass to gluon data loader
-    batch_size = 128
     loader = gluon.data.DataLoader
     train_data = loader(train_ds, batch_size, shuffle=True, last_batch='keep')
     valid_data = loader(valid_ds, batch_size, shuffle=True, last_batch='keep')
@@ -95,10 +115,10 @@ if __name__ == '__main__':
     # Train ResNet 18
     # CV based model validation pretty hard because of long training time.
     # Here we only choose one set to try.
-    num_epochs = 50
-    learning_rate = 0.1
+    num_epochs = 1
+    learning_rate = 0.05
     weight_decay = 1e-4
-    lr_period = 20
+    lr_period = 25
     lr_decay = 0.1
 
     net = ResNet.get_net(ctx)
@@ -108,14 +128,14 @@ if __name__ == '__main__':
     # After get the parameters, we used all train_set to get the model, and to predict.
     net = ResNet.get_net(ctx)
     net.hybridize()
-    train(net, train_data, valid_data, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
+    train(net, train_valid_data, None, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
 
     # prediction
     preds = []
     for data, label in test_data:
         output = net(data.as_in_context(ctx))
-        preds.extend(output.asnumpy().argmax(axis=1))
+        preds.extend(output[:, 1].asnumpy())
 
-    df = pd.DataFrame({'id': test_df['id'], 'is_iceberg': preds})
+    df = pd.DataFrame({'id': test['id'], 'is_iceberg': preds})
     df['id'] = df['id'].astype(str)
-    df.to_csv('../submit/submission2.csv', index=False)
+    df.to_csv('../submit/submission_test.csv', index=False)

@@ -5,19 +5,6 @@ from mxnet import ndarray as nd
 from mxnet import gluon
 
 
-def read_jason(file='', loc='data'):
-    df = pd.read_json('{}/{}'.format(loc, file))
-    df['inc_angle'] = df['inc_angle'].replace('na', -1).astype(float)
-
-    band1 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in df["band_1"]])
-    band2 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in df["band_2"]])
-    df = df.drop(['band_1', 'band_2'], axis=1)
-
-    bands = np.stack((band1, band2), axis=-1)
-    del band1, band2
-    return df, bands
-
-
 def try_gpu():
     try:
         ctx = mx.gpu()
@@ -57,3 +44,5 @@ def _get_batch(batch, ctx):
     return (gluon.utils.split_and_load(data, ctx),
             gluon.utils.split_and_load(label, ctx),
             data.shape[0])
+
+
