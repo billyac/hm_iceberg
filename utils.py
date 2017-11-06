@@ -1,4 +1,3 @@
-import pandas as pd
 import numpy as np
 import mxnet as mx
 from mxnet import ndarray as nd
@@ -46,3 +45,6 @@ def _get_batch(batch, ctx):
             data.shape[0])
 
 
+if __name__ == '__main__':
+    import os
+    print(os.getcwd())

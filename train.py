@@ -1,5 +1,6 @@
 import datetime
 
+import os
 import numpy as np
 import pandas as pd
 from mxnet import autograd
@@ -11,7 +12,7 @@ from sklearn.model_selection import train_test_split
 import ResNet
 import utils
 
-
+path = os.getcwd()
 batch_size = 128
 
 
@@ -57,8 +58,8 @@ if __name__ == '__main__':
 
     # ########### Data Initialization ###########
     # Reading Data.....
-    train = pd.read_json("../data/train.json")
-    test = pd.read_json("../data/test.json")
+    train = pd.read_json(path + "/data/train.json")
+    test = pd.read_json(path + "/data/test.json")
     train.inc_angle = train.inc_angle.replace('na', 0)
     train.inc_angle = train.inc_angle.astype(float).fillna(0.0)
     print("Loading Data done!")
