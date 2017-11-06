@@ -33,17 +33,21 @@ class ResNet(nn.HybridBlock):
             net.add(nn.Conv2D(channels=32, kernel_size=3, strides=1, padding=1))
             net.add(nn.BatchNorm())
             net.add(nn.Activation(activation='relu'))
+            net.add(nn.Dropout(0.2))   # hm_v1
             # block 2
             for _ in range(3):
                 net.add(Residual(channels=32))
+            net.add(nn.Dropout(0.2))   # hm_v1
             # block 3
             net.add(Residual(channels=64, same_shape=False))
             for _ in range(2):
                 net.add(Residual(channels=64))
+            net.add(nn.Dropout(0.2))   # hm_v1
             # block 4
             net.add(Residual(channels=128, same_shape=False))
             for _ in range(2):
                 net.add(Residual(channels=128))
+            net.add(nn.Dropout(0.2))   # hm_v1
             # block 5
             net.add(nn.AvgPool2D(pool_size=8))
             net.add(nn.Flatten())
