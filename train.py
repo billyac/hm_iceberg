@@ -117,7 +117,7 @@ if __name__ == '__main__':
     # CV based model validation pretty hard because of long training time.
     # Here we only choose one set to try.
     num_epochs = 1
-    learning_rate = 0.05
+    learning_rate = 0.01
     weight_decay = 1e-4
     lr_period = 25
     lr_decay = 0.1
@@ -127,9 +127,9 @@ if __name__ == '__main__':
     train(net, train_data, valid_data, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
 
     # After get the parameters, we used all train_set to get the model, and to predict.
-    net = ResNet.get_net(ctx)
-    net.hybridize()
-    train(net, train_valid_data, None, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
+    # net = ResNet.get_net(ctx)
+    # net.hybridize()
+    # train(net, train_valid_data, None, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
 
     # prediction
     preds = []
