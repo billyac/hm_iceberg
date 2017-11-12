@@ -1,142 +1,71 @@
-import datetime
-
-import os
 import numpy as np
 import pandas as pd
-from mxnet import autograd
-from mxnet import gluon
-from mxnet import nd
-from mxnet import image
+import gc
 from sklearn.model_selection import train_test_split
+from keras.optimizers import Adam
 
-import ResNet
+from Models import Keras_CNN
 import utils
-
-path = os.getcwd()
-batch_size = 128
-
-
-def train(net, train_data, valid_data, num_epochs, lr, wd, ctx, lr_period, lr_decay):
-    trainer = gluon.Trainer(
-        net.collect_params(), 'sgd', {'learning_rate': lr, 'momentum': 0.9, 'wd': wd})
-
-    prev_time = datetime.datetime.now()
-    for epoch in range(num_epochs):
-        train_loss = 0.0
-        train_acc = 0.0
-        if epoch > 0 and epoch % lr_period == 0:
-            trainer.set_learning_rate(trainer.learning_rate * lr_decay)
-        for data, label in train_data:
-            label = label.as_in_context(ctx)
-            with autograd.record():
-                output = net(data.as_in_context(ctx))
-                loss = softmax_cross_entropy(output, label)
-            loss.backward()
-            trainer.step(batch_size)
-            train_loss += nd.mean(loss).asscalar()
-            train_acc += utils.accuracy(output, label)
-        cur_time = datetime.datetime.now()
-        h, remainder = divmod((cur_time - prev_time).seconds, 3600)
-        m, s = divmod(remainder, 60)
-        time_str = "Time %02d:%02d:%02d" % (h, m, s)
-        if valid_data is not None:
-            valid_acc = utils.evaluate_accuracy(valid_data, net, ctx)
-            epoch_str = ("Epoch %d. Loss: %f, Train acc %f, Valid acc %f, "
-                         % (epoch, train_loss / len(train_data),
-                            train_acc / len(train_data), valid_acc))
-        else:
-            epoch_str = ("Epoch %d. Loss: %f, Train acc %f, "
-                         % (epoch, train_loss / len(train_data),
-                            train_acc / len(train_data)))
-        prev_time = cur_time
-        print(epoch_str + time_str + ', lr ' + str(trainer.learning_rate))
+import augmentors
 
 
 if __name__ == '__main__':
-    # Loss Function...
-    softmax_cross_entropy = gluon.loss.SoftmaxCrossEntropyLoss()
 
-    # ########### Data Initialization ###########
-    # Reading Data.....
-    train = pd.read_json(path + "/data/train.json")
-    test = pd.read_json(path + "/data/test.json")
-    train.inc_angle = train.inc_angle.replace('na', 0)
-    train.inc_angle = train.inc_angle.astype(float).fillna(0.0)
-    print("Loading Data done!")
+    # Load Data
+    train = pd.read_json("../data/train.json")
+    test = pd.read_json("../data/test.json")
+    print('Loading data......Done')
 
-    # Train data
-    x_band1 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in train["band_1"]])
-    x_band2 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in train["band_2"]])
-    X_train = np.concatenate([x_band1[:, :, :, np.newaxis], x_band2[:, :, :, np.newaxis]
-                             , ((x_band1+x_band2)/2)[:, :, :, np.newaxis]], axis=-1)   # Create a third channel
-    X_angle_train = np.array(train.inc_angle)
-    y_train = np.array(train["is_iceberg"])
+    # Pre-Process Data
+    X_train, X_test, X_train_inc, X_test_inc, target_train, test_id = utils.preprocess_main(train, test)
+    del train; del test; gc.collect();
+    print('Pre-processing data........Done')
 
-    # Test data
-    x_band1 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in test["band_1"]])
-    x_band2 = np.array([np.array(band).astype(np.float32).reshape(75, 75) for band in test["band_2"]])
-    X_test = np.concatenate([x_band1[:, :, :, np.newaxis], x_band2[:, :, :, np.newaxis]
-                             , ((x_band1+x_band2)/2)[:, :, :, np.newaxis]], axis=-1)
-    X_angle_test = np.array(test.inc_angle)
+    # Train Test Split
+    X_train_cv, X_valid, X_angle_train, X_angle_valid, y_train_cv, y_valid \
+        = train_test_split(X_train, X_train_inc, target_train, random_state=6, train_size=0.75)
 
-    # ############# Augmentation #################
-    mean = nd.array([-20.655821, -26.320704, -23.488279])
-    std = nd.array([5.200841, 3.3955173, 3.8151529])
-    normalizer = image.ColorNormalizeAug(mean, std)
-    flip = image.HorizontalFlipAug(1)
+    # Pre-train preparation
+    batch_size = 64
+    file_path = "../weights_resnet1.hdf5"
 
-    X_train_new = [normalizer(nd.array(X_train[i])) for i in range(1604)]    # normalize
-    X_train_new.extend([flip(X_train_new[i]) for i in range(1604)])     # flip
-    y_train_new = np.append(y_train, y_train)  # y_train
-    X_test_new = [normalizer(nd.array(X_test[i])) for i in range(8424)]  # X_test
+    train_generator = augmentors.train_datagen_1.flow(X_train_cv, y_train_cv, batch_size=batch_size)
+    validation_generator = augmentors.test_datagen_1.flow(X_valid, y_valid, batch_size=batch_size)
 
-    # Resize:
-    X_train_new = [nd.transpose(X_train_new[i], (2, 0, 1)) for i in range(len(X_train_new))]
-    X_test_new = [nd.transpose(X_test_new[i], (2, 0, 1)) for i in range(len(X_test_new))]
+    # Load Model
+    model = Keras_CNN.simple_resnet_v1()
+    optimizer = Adam(lr=0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-08)  # decay=0.0015) # Optimizer
+    callbacks = utils.get_callbacks(filepath=file_path, patience=15, save_best=True)  # Callbacks
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])  # Compile
+    model.fit_generator(train_generator,
+                        steps_per_epoch=128,
+                        epochs=200,
+                        verbose=1,
+                        validation_data=(X_valid, y_valid),
+                        # validation_data = validation_generator,
+                        # validation_steps = len(X_valid)/batch_size,
+                        callbacks=callbacks)
+    print('Fit Model.........Done')
 
-    # Train test split
-    X_train, X_test, y_train, y_test = train_test_split(X_train_new, y_train_new, test_size=0.2, random_state=66)
+    # Prior to submission
+    model.load_weights(filepath=file_path)
+    score = model.evaluate(X_valid, y_valid)
+    print('Show score of model with valid set')
+    print('Test loss:', score[0])
+    print('Test accuracy:', score[1])
 
-    # Aggregated Data_Set vs label, to pass to gluon data loader
-    train_ds = [(X_train[i],y_train[i]) for i in range(len(y_train))]
-    valid_ds = [(X_test[i],y_test[i]) for i in range(len(y_test))]
-    train_valid_ds = [(X_train_new[i], y_train_new[i]) for i in range(len(y_train_new))]
-    test_ds = [(X_test_new[i], 0) for i in range(len(X_test_new))]
+    # if submit........
+    print('Start prediction........')
+    predicted_test = model.predict(X_test)
+    submission = pd.DataFrame()
+    submission['id'] = test_id
+    submission['is_iceberg'] = predicted_test.reshape((predicted_test.shape[0]))
 
-    # Pass to gluon data loader
-    loader = gluon.data.DataLoader
-    train_data = loader(train_ds, batch_size, shuffle=True, last_batch='keep')
-    valid_data = loader(valid_ds, batch_size, shuffle=True, last_batch='keep')
-    train_valid_data = loader(train_valid_ds, batch_size, shuffle=True, last_batch='keep')
-    test_data = loader(test_ds, batch_size, shuffle=False, last_batch='keep')
+    # Potential Leak angle:
+    leaky_angle = [34.4721, 42.5591, 33.6352, 36.1061, 39.2340]
+    mask = [test['inc_angle'][i] in leaky_angle for i in range(len(test))]
+    column_name = 'is_iceberg'
+    submission.loc[mask, column_name] = 1
 
-    # Get GPU information
-    ctx = utils.try_gpu()
-
-    # Train ResNet 18
-    # CV based model validation pretty hard because of long training time.
-    # Here we only choose one set to try.
-    num_epochs = 1
-    learning_rate = 0.01
-    weight_decay = 1e-4
-    lr_period = 25
-    lr_decay = 0.1
-
-    net = ResNet.get_net(ctx)
-    net.hybridize()
-    train(net, train_data, valid_data, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
-
-    # After get the parameters, we used all train_set to get the model, and to predict.
-    # net = ResNet.get_net(ctx)
-    # net.hybridize()
-    # train(net, train_valid_data, None, num_epochs, learning_rate, weight_decay, ctx, lr_period, lr_decay)
-
-    # prediction
-    preds = []
-    for data, label in test_data:
-        output = net(data.as_in_context(ctx))
-        preds.extend(output[:, 1].asnumpy())
-
-    df = pd.DataFrame({'id': test['id'], 'is_iceberg': preds})
-    df['id'] = df['id'].astype(str)
-    df.to_csv('../submit/submission_test.csv', index=False)
+    # submission to csv, need time string
+    submission.to_csv('../submit/submission_time.csv', index=False)
