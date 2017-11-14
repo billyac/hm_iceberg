@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+.ipynb_checkpoints/
+
+# data, weights, submission with hm_iceberg
+data/
+submit/
+weights/
