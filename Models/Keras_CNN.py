@@ -79,3 +79,67 @@ def simple_resnet_v1(input_shape=(75, 75, 3), KernelSize = (5, 5), Momentum = 0.
 
     model = Model(inputs = X_input, outputs = X, name='simple_resnet')
     return model
+
+
+def simple_resnet_1113(input_shape = (75,75,3), KernelSize = (5,5), Momentum = 0.99):
+
+    X_input = Input(input_shape)
+    #input_CNN = ZeroPadding2D((0, 0))(X_input)
+    input_CNN = BatchNormalization(momentum = Momentum)(X_input)
+
+    ## Input Layer
+    input_CNN = Conv2D(32,kernel_size=KernelSize,padding='same', name='c11')(input_CNN)
+    input_CNN = BatchNormalization(momentum = Momentum, name='b11')(input_CNN)
+    input_CNN = Activation('elu')(input_CNN)
+    input_CNN = MaxPooling2D((2,2),strides=(2, 2),name='m11')(input_CNN)
+    #input_CNN = Dropout(0.25)(input_CNN)
+    input_CNN = Conv2D(64,kernel_size=KernelSize,padding='same',name='c12')(input_CNN)
+    input_CNN = BatchNormalization(momentum = Momentum,name='b12')(input_CNN)
+    input_CNN = Activation('elu')(input_CNN)
+    input_CNN = MaxPooling2D((2,2),strides=(2, 2),name='m12')(input_CNN)
+    #input_CNN = Dropout(0.25)(input_CNN)
+
+    ## First Residual
+    input_CNN_residual = BatchNormalization(momentum=Momentum)(input_CNN)
+    input_CNN_residual = Conv2D(128,kernel_size=KernelSize,padding='same')(input_CNN_residual)
+    input_CNN_residual = BatchNormalization(momentum = Momentum)(input_CNN_residual)
+    input_CNN_residual = Activation('elu')(input_CNN_residual)
+    input_CNN_residual = Dropout(0.25)(input_CNN_residual)
+    input_CNN_residual = Conv2D(64,kernel_size=KernelSize,padding='same')(input_CNN_residual)
+    input_CNN_residual = BatchNormalization(momentum = Momentum)(input_CNN_residual)
+    input_CNN_residual = Activation('elu')(input_CNN_residual)
+    input_CNN_residual = Dropout(0.25)(input_CNN_residual)
+
+    input_CNN_residual = Add()([input_CNN_residual,input_CNN])
+
+    ## Top CNN
+    top_CNN = Conv2D(128, kernel_size = KernelSize, padding ='same')(input_CNN_residual)
+    top_CNN = BatchNormalization(momentum=Momentum)(top_CNN)
+    top_CNN = Activation('elu')(top_CNN)
+    top_CNN = MaxPooling2D((2,2),strides=(2, 2))(top_CNN)
+    top_CNN = Conv2D(256, kernel_size = KernelSize, padding ='same')(top_CNN)
+    top_CNN = BatchNormalization(momentum=Momentum)(top_CNN)
+    top_CNN = Activation('elu')(top_CNN)
+    top_CNN = Dropout(0.25)(top_CNN)
+    top_CNN = MaxPooling2D((2,2),strides=(2, 2))(top_CNN)
+    top_CNN = Conv2D(512, kernel_size = KernelSize, padding ='same')(top_CNN)
+    top_CNN = BatchNormalization(momentum=Momentum)(top_CNN)
+    top_CNN = Activation('elu')(top_CNN)
+    top_CNN = Dropout(0.25)(top_CNN)
+    top_CNN = MaxPooling2D((2,2),strides=(2, 2))(top_CNN)
+    top_CNN = GlobalMaxPooling2D()(top_CNN)
+
+    #Dense Layers
+    #X = Flatten()(top_CNN)
+    X = Dense(512)(top_CNN)
+    X = BatchNormalization(momentum=Momentum)(X)
+    X = Activation('elu')(X)
+    X = Dropout(0.25)(X)
+    X = Dense(256)(X)
+    X = BatchNormalization(momentum=Momentum)(X)
+    X = Activation('elu')(X)
+    X = Dropout(0.25)(X)
+    X = Dense(1, activation='sigmoid')(X)
+
+    model = Model(inputs = X_input, outputs = X, name='simple_resnet')
+    return model
