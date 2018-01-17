@@ -36,9 +36,12 @@ CV_RANDOM_SEED = 42
 IMAGE_AUGMENT_SEED = 55
 
 
-def dispatch(train_files, learning_rate, job_dir, train_batch_size=32,
+def dispatch(train_files, learning_rate, job_dir,
+             train_batch_size=64, num_epochs=100, steps_per_epoch=15,
              cv=1, val_ratio=0.2, # cross validation
              decay=0.01, # learning rate decay
+             fc_layers=[512], dropouts=[0.5], # fully connected layers
+             trainable_layers=166, # trainable transfer learning model layers
             ):
     # log some infomation.
     logging.info("start dispatch")
@@ -58,14 +61,14 @@ def dispatch(train_files, learning_rate, job_dir, train_batch_size=32,
         np.array(band).astype(np.float64).reshape(75, 75)
         for band in train_df["band_1"]
     ])
-    # Scale the input graph to 0-1
-    band_1 = (band_1 - band_1.min()) / (band_1.max() - band_1.min())
+    # Scale the input graph to -1 to 1
+    band_1 = (band_1 - band_1.min()) / (band_1.max() - band_1.min()) * 2 - 1
 
     band_2 = np.array([
         np.array(band).astype(np.float64).reshape(75, 75)
         for band in train_df["band_2"]
     ])
-    band_2 = (band_2 - band_2.min()) / (band_2.max() - band_2.min())
+    band_2 = (band_2 - band_2.min()) / (band_2.max() - band_2.min()) * 2 - 1
 
     X = np.concatenate(
         [
@@ -119,8 +122,7 @@ def dispatch(train_files, learning_rate, job_dir, train_batch_size=32,
         # 2. predict on test set
         # 3. record prediction on trainning and validation for analysis
 
-        # TODO: try freeze the transfer model layers.
-        model = get_model()
+        model = get_model(fc_layers, dropouts, trainable_layers)
 
         # optimizer
         optimizer = Adam(
@@ -147,21 +149,26 @@ def dispatch(train_files, learning_rate, job_dir, train_batch_size=32,
 
         # TensorBoard callback, used to record training process for later
         # plotting using TensorBoard
-        tensorboard = TensorBoard(log_dir=os.path.join(job_dir, 'logs'), write_graph=False)
+        tensorboard = TensorBoard(
+            log_dir=os.path.join(job_dir, 'logs'), write_graph=False
+        )
 
         # Train model and validate along the way
         model.fit_generator(
             gen_flow,
             # TODO: investigate if the gen_flow shuffle before every epoch,
             # else, each epoch will be seeing the same samples
-            steps_per_epoch=15,
-            epochs=50,
+            steps_per_epoch=steps_per_epoch,
+            epochs=num_epochs,
             shuffle=True,
             verbose=1,
             validation_data=([X_val, X_inc_val], y_val),
             callbacks=[tensorboard])
 
-def get_model():
+def get_model(fc_layers, dropouts, trainable_layers=166):
+    # dropouts either has the same size of fc_layers or has length 1 (dropout
+    # ratio of all fc layers are the same in this case).
+    assert len(dropouts) == 1 or len(fc_layers) == len(dropouts)
     # input layers
     input_image = Input(shape=(75, 75, 2), name="image")
     input_angle = Input(shape=[1], name="angle")
@@ -176,20 +183,34 @@ def get_model():
         weights='imagenet',
         include_top=False,
         input_shape=(139, 139, 3),
-        pooling='max')
-    # freeze the transfer learning model layers
-    for layer in transfer_model.layers:
+        pooling='avg')
+    # freeze the transfer learning model layers except last layers, default to
+    # last 166 layers for InceptionResNetV2.
+    # the last 166 layers includes 10x block8 (Inception-ResNet-C block) of size
+    # 8 x 8 x 2080 and one final convolution block of size 8 x 8 x 1536
+    # When we make the transfer model a parameter, default trainable layers need
+    # to be removed.
+    if trainable_layers <= 0:
+        frozen_layers = transfer_model.layers
+    else:
+        frozen_layers = transfer_model.layers[:-trainable_layers]
+    for layer in frozen_layers:
         layer.trainable = False
     # attach image layers to the input of the transfer model
     transfer_model = transfer_model(image_layer)
 
     # merge transfer learning model's bottleneck layer with angle input
     merged_model = concatenate([transfer_model, input_angle])
-    # fully connected layers
-    merged_model = Dense(512, name='fc1')(merged_model)
-    merged_model = Activation('relu')(merged_model)
-    merged_model = Dropout(0.5)(merged_model)
 
+    # fully connected layers
+    if len(dropouts) == 1:
+        dropouts = dropouts * len(fc_layers)
+    for i, (fc_layer, dropout) in enumerate(zip(fc_layers, dropouts)):
+        merged_model = Dense(fc_layer, name='fc_%d' %i)(merged_model)
+        merged_model = Activation('relu')(merged_model)
+        merged_model = Dropout(dropout)(merged_model)
+
+    # prediction layer
     predictions = Dense(1, activation='sigmoid')(merged_model)
 
     model = Model(inputs=[input_image, input_angle], outputs=predictions)
@@ -227,16 +248,19 @@ if __name__ == '__main__':
         nargs='+',
         required=True)
 
-    # parser.add_argument(
-    #     '--num-epochs',
-    #     help="""\
-    #         Maximum number of training data epochs on which to train.
-    #         If both --max-steps and --num-epochs are specified,
-    #         the training job will run for --max-steps or --num-epochs,
-    #         whichever occurs first. If unspecified will run for --max-steps.\
-    #     """,
-    #     type=int,
-    # )
+    parser.add_argument(
+        '--num-epochs',
+        help=""" Number of training data epochs on which to train. """,
+        type=int,
+        default=100
+    )
+
+    parser.add_argument(
+        '--steps-per-epoch',
+        help=""" Number of batches to go through per epoch. """,
+        type=int,
+        default=15
+    )
 
     parser.add_argument(
         '--train-batch-size',
@@ -253,10 +277,54 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
+        '--decay',
+        help='Learning rate decay over each epoch',
+        type=float,
+        default=0.01
+    )
+
+    parser.add_argument(
         '--job-dir',
         help='Job dir',
         type=str,
         default=''
+    )
+
+    parser.add_argument(
+        '--fc-layers',
+        help='''
+            Specify fully connected layers, provide a list of number, each
+            represent the size of a layer. For example, "--fc-layers 512 256"
+            means two fully connected layers of size 512 and 256.
+        ''',
+        type=int,
+        nargs='*', # accept arbitrary numbers of input
+        default=[512]
+    )
+
+    parser.add_argument(
+        '--dropouts',
+        help='''
+            Specify fully connected layers' dropouts. When input multiple
+            numnbers, need to be the same count as the fc-layers's input. Each
+            number means the dropout ratio of the corresponding fully connected
+            layer; when input one number, it will be the dropout ratio of all
+            fc layers.
+        ''',
+        type=float,
+        nargs='*', # accept arbitrary numbers of input
+        default=[0.5] # default dropout for all fully connected layers
+    )
+
+    parser.add_argument(
+        '--trainable-layers',
+        help='''
+            The number of last layers in the transfer learning model that is
+            trainable. Default to 166 for InceptionResNetV2, need to change this
+            when we make the transfer model a parameter.
+        ''',
+        type=int,
+        default=166 # default to all layers in transfer learning model are frozen
     )
 
     # parse command line arguments
