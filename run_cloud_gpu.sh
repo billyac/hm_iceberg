@@ -10,4 +10,7 @@ gcloud ml-engine jobs submit training $JOB_NAME \
   --region us-central1 \
   --scale-tier BASIC_GPU \
   -- \
-  --train-files $TRAIN_DATA
+  --train-files $TRAIN_DATA \
+  --fc-layers 512 512 \
+  --dropouts 0.5 \
+  --trainable-layers -1 # All layers are trainable

@@ -43,9 +43,20 @@ def dispatch(train_files, learning_rate, job_dir,
              fc_layers=[512], dropouts=[0.5], # fully connected layers
              trainable_layers=166, # trainable transfer learning model layers
             ):
-    # log some infomation.
-    logging.info("start dispatch")
-    logging.info(str(train_files))
+    # log parameters.
+    logging.info('start dispatch')
+    logging.info('train_files: %s' %train_files)
+    logging.info('learning_rate: %s' %learning_rate)
+    logging.info('decay: %s' %decay)
+    logging.info('job_dir: %s' %job_dir)
+    logging.info('train_batch_size: %s' %train_batch_size)
+    logging.info('num_epochs: %s' %num_epochs)
+    logging.info('steps_per_epoch: %s' %steps_per_epoch)
+    logging.info('cv: %s' %cv)
+    logging.info('val_ratio: %s' %val_ratio)
+    logging.info('fc_layers: %s' %fc_layers)
+    logging.info('dropouts: %s' %dropouts)
+    logging.info('trainable_layers: %s' %trainable_layers)
 
     # Original Data
     with file_io.FileIO(train_files[0], mode='r') as train_input:
@@ -138,9 +149,17 @@ def dispatch(train_files, learning_rate, job_dir,
         )
 
         # data flow generator, with image data augmented.
+        # generator = ImageDataGenerator(
+        #     horizontal_flip=True,
+        #     vertical_flip=True
+        # )
         generator = ImageDataGenerator(
+            rotation_range=20,
             horizontal_flip=True,
-            vertical_flip=True
+            vertical_flip=True,
+            width_shift_range = 0.1,
+            height_shift_range = 0.1,
+            zoom_range = 0.1
         )
 
         gen_flow = gen_flow_for_two_inputs(
@@ -190,7 +209,9 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
     # 8 x 8 x 2080 and one final convolution block of size 8 x 8 x 1536
     # When we make the transfer model a parameter, default trainable layers need
     # to be removed.
-    if trainable_layers <= 0:
+    if trainable_layers < 0:
+        frozen_layers = []
+    elif trainable_layers == 0:
         frozen_layers = transfer_model.layers
     else:
         frozen_layers = transfer_model.layers[:-trainable_layers]
@@ -321,7 +342,8 @@ if __name__ == '__main__':
         help='''
             The number of last layers in the transfer learning model that is
             trainable. Default to 166 for InceptionResNetV2, need to change this
-            when we make the transfer model a parameter.
+            when we make the transfer model a parameter. 0 means all layers are
+            frozen; -1 (actually < 0) means all layers are trainable.
         ''',
         type=int,
         default=166 # default to all layers in transfer learning model are frozen
