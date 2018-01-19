@@ -35,28 +35,29 @@ sess = tf.Session(config=config)
 CV_RANDOM_SEED = 42
 IMAGE_AUGMENT_SEED = 55
 
+# File paths
+BEST_MODEL_PATH = 'best_model.hdf5'
+PRED_VAL_PATH = 'pred_val.csv'
+PRED_TRAIN_PATH = 'pred_train.csv'
 
 def dispatch(train_files, learning_rate, job_dir,
              train_batch_size=64, num_epochs=100, steps_per_epoch=15,
              cv=1, val_ratio=0.2, # cross validation
              decay=0.01, # learning rate decay
+             # num of epoches without improvement to trigger early stopping
+             patience=15,
              fc_layers=[512], dropouts=[0.5], # fully connected layers
              trainable_layers=166, # trainable transfer learning model layers
             ):
     # log parameters.
     logging.info('start dispatch')
-    logging.info('train_files: %s' %train_files)
-    logging.info('learning_rate: %s' %learning_rate)
-    logging.info('decay: %s' %decay)
-    logging.info('job_dir: %s' %job_dir)
-    logging.info('train_batch_size: %s' %train_batch_size)
-    logging.info('num_epochs: %s' %num_epochs)
-    logging.info('steps_per_epoch: %s' %steps_per_epoch)
-    logging.info('cv: %s' %cv)
-    logging.info('val_ratio: %s' %val_ratio)
-    logging.info('fc_layers: %s' %fc_layers)
-    logging.info('dropouts: %s' %dropouts)
-    logging.info('trainable_layers: %s' %trainable_layers)
+    # format the parameter dict prettier
+    parameters_json_str = json.dumps(locals(), indent=2)
+    logging.info(parameters_json_str)
+
+    # Write parameters to a file for experiment analysis
+    with file_io.FileIO(os.path.join(job_dir, 'parameters.json'), mode='w') as param_output:
+        param_output.write(parameters_json_str)
 
     # Original Data
     with file_io.FileIO(train_files[0], mode='r') as train_input:
@@ -94,6 +95,9 @@ def dispatch(train_files, learning_rate, job_dir,
     X_inc = np.array(train_df.inc_angle)
     X_inc = X_inc / X_inc.max()
 
+    # Ids: for saving prediction use later
+    X_id = train_df['id']
+
 
     # Set up cross validation: randomnly divide the data into several
     # training and validation splits, validation size can be set through
@@ -106,24 +110,34 @@ def dispatch(train_files, learning_rate, job_dir,
         # generate a shuffle.
         permutation = np.random.permutation(sample_size)
         # validation set.
+        X_id_val = X_id[permutation[: validate_size]]
         X_val = X[permutation[: validate_size]]
         X_inc_val = X_inc[permutation[: validate_size]]
         y_val = train_target[permutation[: validate_size]]
         # trainning set.
+        X_id_train = X_id[permutation[validate_size :]]
         X_train = X[permutation[validate_size :]]
         X_inc_train = X_inc[permutation[validate_size :]]
         y_train = train_target[permutation[validate_size :]]
         # add to folds.
-        folds.append((X_train, X_inc_train, y_train, X_val, X_inc_val, y_val))
+        folds.append(
+            (X_id_train, X_train, X_inc_train, y_train,
+             X_id_val, X_val, X_inc_val, y_val)
+        )
 
     # Training and cross validation.
-    for i, (X_train, X_inc_train, y_train, X_val, X_inc_val, y_val) in enumerate(folds):
+    for i, (
+        X_id_train, X_train, X_inc_train, y_train,
+        X_id_val, X_val, X_inc_val, y_val
+    ) in enumerate(folds):
         logging.info('===================FOLD=%d' %i)
         # sanity check
         train_size = sample_size - validate_size
+        assert len(X_id_train) == train_size
         assert len(X_train) == train_size
         assert len(X_inc_train) == train_size
         assert len(y_train) == train_size
+        assert len(X_id_val) == validate_size
         assert len(X_val) == validate_size
         assert len(X_inc_val) == validate_size
         assert len(y_val) == validate_size
@@ -166,10 +180,34 @@ def dispatch(train_files, learning_rate, job_dir,
             X_train, X_inc_train, y_train, generator, train_batch_size
         )
 
+        # Callbacks
         # TensorBoard callback, used to record training process for later
         # plotting using TensorBoard
         tensorboard = TensorBoard(
-            log_dir=os.path.join(job_dir, 'logs'), write_graph=False
+            log_dir=os.path.join(job_dir, 'logs'),
+            write_graph=False
+        )
+
+        # EarlyStopping callback. By default monitoring val_loss decrease
+        early_stopping = EarlyStopping(patience=patience)
+
+        # ModelCheckpoint callback. By default monitoring val_loss min
+        # TODO: add a callback to record models so that we can pick up one and
+        # keep training
+        model_dir = os.path.join(job_dir, 'models')
+        if job_dir.startswith("gs://"):
+            # Work-around fro h5py not able to handle writing to Google Cloud
+            # Storage. Save to local first then copy to GCS
+            best_model_path = BEST_MODEL_PATH
+        else:
+            if not os.path.exists(model_dir):
+                os.mkdir(model_dir)
+            best_model_path = os.path.join(model_dir, BEST_MODEL_PATH)
+
+        model_checkpoint = ModelCheckpoint(
+            best_model_path,
+            save_best_only=True,
+            save_weights_only=True # model architecture won't change when load
         )
 
         # Train model and validate along the way
@@ -182,7 +220,53 @@ def dispatch(train_files, learning_rate, job_dir,
             shuffle=True,
             verbose=1,
             validation_data=([X_val, X_inc_val], y_val),
-            callbacks=[tensorboard])
+            callbacks=[
+                tensorboard,
+                early_stopping,
+                model_checkpoint
+            ]
+        )
+
+        # Load the best model and save train and validation predictions
+        model.load_weights(filepath=best_model_path)
+
+        pred_dir = os.path.join(job_dir, 'predictions')
+        if job_dir.startswith("gs://"):
+            # Work-around for pandas not able to handling writing to GCS.
+            # Save to local first then copy to GCS.
+            pred_val_path = PRED_VAL_PATH
+            pred_train_path = PRED_TRAIN_PATH
+        else:
+            if not os.path.exists(pred_dir):
+                os.mkdir(pred_dir)
+            pred_val_path = os.path.join(pred_dir, PRED_VAL_PATH)
+            pred_train_path = os.path.join(pred_dir, PRED_TRAIN_PATH)
+
+        # Get validation Score.
+        pred_val = model.predict([X_val, X_inc_val])
+        pred_val_df = pd.DataFrame({
+            'id': X_id_val,
+            'pred': pred_val.ravel(), # flatten the 2-d array to 1-d
+            'is_iceberg': y_val
+        })
+        pred_val_df.to_csv(pred_val_path)
+
+        pred_train = model.predict([X_train, X_inc_train])
+        pred_train_df = pd.DataFrame({
+            'id': X_id_train,
+            'pred': pred_train.ravel(), # flatten the 2-d array to 1-d
+            'is_iceberg': y_train
+        })
+        pred_train_df.to_csv(pred_train_path)
+
+        # Copy files to GCS if running on cloud
+        if job_dir.startswith("gs://"):
+            # best model
+            copy_file_to_gcs(model_dir, BEST_MODEL_PATH)
+            # predictions
+            copy_file_to_gcs(pred_dir, PRED_VAL_PATH)
+            copy_file_to_gcs(pred_dir, PRED_TRAIN_PATH)
+
 
 def get_model(fc_layers, dropouts, trainable_layers=166):
     # dropouts either has the same size of fc_layers or has length 1 (dropout
@@ -229,7 +313,8 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
     for i, (fc_layer, dropout) in enumerate(zip(fc_layers, dropouts)):
         merged_model = Dense(fc_layer, name='fc_%d' %i)(merged_model)
         merged_model = Activation('relu')(merged_model)
-        merged_model = Dropout(dropout)(merged_model)
+        if dropout > 0:
+            merged_model = Dropout(dropout)(merged_model)
 
     # prediction layer
     predictions = Dense(1, activation='sigmoid')(merged_model)
@@ -256,6 +341,12 @@ def gen_flow_for_two_inputs(X1, X2, y, generator, batch_size):
         # yield batches of ([augmented images, angles], labels)
         yield [X1i[0], X2i[1]], X1i[1]
 
+# h5py workaround: copy local models over to GCS if the job_dir is GCS.
+def copy_file_to_gcs(gcs_dir, file_path):
+  with file_io.FileIO(file_path, mode='r') as input_f:
+    with file_io.FileIO(os.path.join(gcs_dir, file_path), mode='w+') as output_f:
+        output_f.write(input_f.read())
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
@@ -268,6 +359,13 @@ if __name__ == '__main__':
         help='GCS or local paths to trainning data',
         nargs='+',
         required=True)
+
+    parser.add_argument(
+        '--cv',
+        help=""" Number of folds for cross validation. """,
+        type=int,
+        default=1
+    )
 
     parser.add_argument(
         '--num-epochs',
@@ -302,6 +400,13 @@ if __name__ == '__main__':
         help='Learning rate decay over each epoch',
         type=float,
         default=0.01
+    )
+
+    parser.add_argument(
+        '--patience',
+        help='Number of epoches without improvement to trigger early stopping',
+        type=int,
+        default=15
     )
 
     parser.add_argument(
