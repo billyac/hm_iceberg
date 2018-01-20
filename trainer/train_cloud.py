@@ -27,6 +27,7 @@ from keras.preprocessing.image import ImageDataGenerator
 # from keras.utils import layer_utils, plot_model
 # from keras.utils.data_utils import get_file
 from keras.callbacks import TensorBoard
+from sklearn.metrics import log_loss
 
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
@@ -34,11 +35,6 @@ sess = tf.Session(config=config)
 
 CV_RANDOM_SEED = 42
 IMAGE_AUGMENT_SEED = 55
-
-# File paths
-BEST_MODEL_PATH = 'best_model.hdf5'
-PRED_VAL_PATH = 'pred_val.csv'
-PRED_TRAIN_PATH = 'pred_train.csv'
 
 def dispatch(train_files, learning_rate, job_dir,
              train_batch_size=64, num_epochs=100, steps_per_epoch=15,
@@ -48,17 +44,14 @@ def dispatch(train_files, learning_rate, job_dir,
              patience=15,
              fc_layers=[512], dropouts=[0.5], # fully connected layers
              trainable_layers=166, # trainable transfer learning model layers
+             do_predict_test=False, test_file='' # predict test data
             ):
     # log parameters.
     logging.info('start dispatch')
-    # format the parameter dict prettier
-    parameters_json_str = json.dumps(locals(), indent=2)
-    logging.info(parameters_json_str)
+    # Preserve input parameters for saving them later
+    parameters = locals()
 
-    # Write parameters to a file for experiment analysis
-    with file_io.FileIO(os.path.join(job_dir, 'parameters.json'), mode='w') as param_output:
-        param_output.write(parameters_json_str)
-
+    # Trainning data
     # Original Data
     with file_io.FileIO(train_files[0], mode='r') as train_input:
         train_data = json.load(train_input)
@@ -74,13 +67,18 @@ def dispatch(train_files, learning_rate, job_dir,
         for band in train_df["band_1"]
     ])
     # Scale the input graph to -1 to 1
-    band_1 = (band_1 - band_1.min()) / (band_1.max() - band_1.min()) * 2 - 1
+    # preserve those values for later scaling test data use
+    band_1_max = band_1.max()
+    band_1_min = band_1.min()
+    band_1 = (band_1 - band_1_min) / (band_1_max - band_1_min) * 2 - 1
 
     band_2 = np.array([
         np.array(band).astype(np.float64).reshape(75, 75)
         for band in train_df["band_2"]
     ])
-    band_2 = (band_2 - band_2.min()) / (band_2.max() - band_2.min()) * 2 - 1
+    band_2_max = band_2.max()
+    band_2_min = band_2.min()
+    band_2 = (band_2 - band_2_min) / (band_2_max - band_2_min) * 2 - 1
 
     X = np.concatenate(
         [
@@ -93,10 +91,49 @@ def dispatch(train_files, learning_rate, job_dir,
     # Incident angles: fill nan with 0, and scale to 0 - 1.
     train_df.inc_angle = train_df.inc_angle.replace('na', 0)
     X_inc = np.array(train_df.inc_angle)
-    X_inc = X_inc / X_inc.max()
+    X_inc_max = X_inc.max()
+    X_inc = X_inc / X_inc_max
 
     # Ids: for saving prediction use later
     X_id = train_df['id']
+
+    # Testing data
+    # Only load them if needed
+    if do_predict_test:
+        with file_io.FileIO(test_file, mode='r') as test_input:
+            test_data = json.load(test_input)
+        test_df = pd.DataFrame(test_data)
+
+        # Preprocess
+        # Images: resize images to 75*75, 2 channels, and scale each channel to
+        # range 0 to 1.
+        band_1_test = np.array([
+            np.array(band).astype(np.float64).reshape(75, 75)
+            for band in test_df["band_1"]
+        ])
+        # Scale the test graph using the same scale as training
+        band_1_test = (band_1_test - band_1_min) / (band_1_max - band_1_min) * 2 - 1
+
+        band_2_test = np.array([
+            np.array(band).astype(np.float64).reshape(75, 75)
+            for band in test_df["band_2"]
+        ])
+        band_2_test = (band_2_test - band_2_min) / (band_2_max - band_2_min) * 2 - 1
+
+        X_test = np.concatenate(
+            [
+                band_1_test[:, :, :, np.newaxis],
+                band_2_test[:, :, :, np.newaxis]
+            ],
+            axis=-1
+        )
+
+        # Incident angles: fill nan with 0, and using the same scale as training
+        test_df.inc_angle = test_df.inc_angle.replace('na', 0)
+        X_inc_test = np.array(test_df.inc_angle)
+        X_inc_test = X_inc_test / X_inc_max
+
+        test_id = test_df['id']
 
 
     # Set up cross validation: randomnly divide the data into several
@@ -125,7 +162,12 @@ def dispatch(train_files, learning_rate, job_dir,
              X_id_val, X_val, X_inc_val, y_val)
         )
 
-    # Training and cross validation.
+    # Training, cross validation and predict on test if needed.
+    avg_val_score = 0
+    avg_train_score = 0
+    avg_pred_test = None
+    pred_dir = os.path.join(job_dir, 'predictions')
+
     for i, (
         X_id_train, X_train, X_inc_train, y_train,
         X_id_val, X_val, X_inc_val, y_val
@@ -198,11 +240,11 @@ def dispatch(train_files, learning_rate, job_dir,
         if job_dir.startswith("gs://"):
             # Work-around fro h5py not able to handle writing to Google Cloud
             # Storage. Save to local first then copy to GCS
-            best_model_path = BEST_MODEL_PATH
+            best_model_path = 'best_model_%d.hdf5' %i
         else:
             if not os.path.exists(model_dir):
                 os.mkdir(model_dir)
-            best_model_path = os.path.join(model_dir, BEST_MODEL_PATH)
+            best_model_path = os.path.join(model_dir, 'best_model_%d.hdf5' %i)
 
         model_checkpoint = ModelCheckpoint(
             best_model_path,
@@ -230,31 +272,32 @@ def dispatch(train_files, learning_rate, job_dir,
         # Load the best model and save train and validation predictions
         model.load_weights(filepath=best_model_path)
 
-        pred_dir = os.path.join(job_dir, 'predictions')
         if job_dir.startswith("gs://"):
             # Work-around for pandas not able to handling writing to GCS.
             # Save to local first then copy to GCS.
-            pred_val_path = PRED_VAL_PATH
-            pred_train_path = PRED_TRAIN_PATH
+            pred_val_path = 'pred_val_%d.csv' %i
+            pred_train_path = 'pred_train_%d.csv' %i
         else:
             if not os.path.exists(pred_dir):
                 os.mkdir(pred_dir)
-            pred_val_path = os.path.join(pred_dir, PRED_VAL_PATH)
-            pred_train_path = os.path.join(pred_dir, PRED_TRAIN_PATH)
+            pred_val_path = os.path.join(pred_dir, 'pred_val_%d.csv' %i)
+            pred_train_path = os.path.join(pred_dir, 'pred_train_%d.csv' %i)
 
         # Get validation Score.
-        pred_val = model.predict([X_val, X_inc_val])
+        pred_val = model.predict([X_val, X_inc_val]).ravel() # flatten the 2-d array to 1-d
+        avg_val_score += log_loss(y_val, pred_val)
         pred_val_df = pd.DataFrame({
             'id': X_id_val,
-            'pred': pred_val.ravel(), # flatten the 2-d array to 1-d
+            'pred': pred_val,
             'is_iceberg': y_val
         })
         pred_val_df.to_csv(pred_val_path)
 
-        pred_train = model.predict([X_train, X_inc_train])
+        pred_train = model.predict([X_train, X_inc_train]).ravel()
+        avg_train_score += log_loss(y_train, pred_train)
         pred_train_df = pd.DataFrame({
             'id': X_id_train,
-            'pred': pred_train.ravel(), # flatten the 2-d array to 1-d
+            'pred': pred_train,
             'is_iceberg': y_train
         })
         pred_train_df.to_csv(pred_train_path)
@@ -262,10 +305,52 @@ def dispatch(train_files, learning_rate, job_dir,
         # Copy files to GCS if running on cloud
         if job_dir.startswith("gs://"):
             # best model
-            copy_file_to_gcs(model_dir, BEST_MODEL_PATH)
+            copy_file_to_gcs(model_dir, best_model_path)
             # predictions
-            copy_file_to_gcs(pred_dir, PRED_VAL_PATH)
-            copy_file_to_gcs(pred_dir, PRED_TRAIN_PATH)
+            copy_file_to_gcs(pred_dir, pred_val_path)
+            copy_file_to_gcs(pred_dir, pred_train_path)
+
+        if do_predict_test:
+            pred_test = model.predict([X_test, X_inc_test]).flatten()
+            if avg_pred_test is None:
+                avg_pred_test = pred_test
+            else:
+                avg_pred_test += pred_test
+
+    # Add average validation and training score to record
+    parameters['avg_val_score'] = avg_val_score / cv
+    parameters['avg_train_score'] = avg_train_score / cv
+    parameters_json_str = json.dumps(parameters, indent=2)
+    logging.info(parameters_json_str)
+
+    # Write parameters and scores to a file for experiment analysis
+    with file_io.FileIO(os.path.join(job_dir, 'records.json'), mode='w') as records_output:
+        records_output.write(parameters_json_str)
+
+    if do_predict_test:
+        avg_pred_test = avg_pred_test / cv
+        leaky_angle = [34.4721, 42.5591, 33.6352, 36.1061, 39.2340]
+        mask = [X_inc_test[i] in leaky_angle for i in range(len(test_id))]
+        avg_pred_test[mask] = 1
+
+        # Save average test prediction
+        if job_dir.startswith("gs://"):
+            pred_test_path = 'pred_test_%s.csv' %job_dir.split('/')[-1]
+        else:
+            pred_test_path = os.path.join(pred_dir, 'pred_test.csv')
+        save_submit(test_id, avg_pred_test, pred_test_path)
+        if job_dir.startswith("gs://"):
+            copy_file_to_gcs(pred_dir, pred_test_path)
+
+
+def save_submit(test_id, preds, save_path):
+    # Sanity check
+    assert len(test_id) == len(preds)
+
+    submission = pd.DataFrame()
+    submission['id']=test_id
+    submission['is_iceberg']=preds
+    submission.to_csv(save_path, index=False)
 
 
 def get_model(fc_layers, dropouts, trainable_layers=166):
@@ -306,6 +391,7 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
 
     # merge transfer learning model's bottleneck layer with angle input
     merged_model = concatenate([transfer_model, input_angle])
+    # merged_model = transfer_model
 
     # fully connected layers
     if len(dropouts) == 1:
@@ -315,6 +401,7 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
         merged_model = Activation('relu')(merged_model)
         if dropout > 0:
             merged_model = Dropout(dropout)(merged_model)
+    # merged_model = concatenate([merged_model, input_angle])
 
     # prediction layer
     predictions = Dense(1, activation='sigmoid')(merged_model)
@@ -410,13 +497,6 @@ if __name__ == '__main__':
     )
 
     parser.add_argument(
-        '--job-dir',
-        help='Job dir',
-        type=str,
-        default=''
-    )
-
-    parser.add_argument(
         '--fc-layers',
         help='''
             Specify fully connected layers, provide a list of number, each
@@ -453,6 +533,28 @@ if __name__ == '__main__':
         type=int,
         default=166 # default to all layers in transfer learning model are frozen
     )
+
+    parser.add_argument(
+        '--test-file',
+        help='GCS or local path to test data',
+        type=str,
+        default=''
+    )
+
+    parser.add_argument(
+        '--do-predict-test',
+        help='Whether predicting on test data or not',
+        type=bool,
+        default=False
+    )
+
+    parser.add_argument(
+        '--job-dir',
+        help='Job dir',
+        type=str,
+        default=''
+    )
+
 
     # parse command line arguments
     args = parser.parse_args()

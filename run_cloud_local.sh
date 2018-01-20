@@ -4,8 +4,11 @@ gcloud ml-engine local train \
 	--job-dir output \
 	-- \
 	--train-files data/train.json \
+	--cv 2 \
         --fc-layers 2 \
 	--dropouts 0 \
 	--trainable-layers 0 \
 	--steps-per-epoch 1 \
-	--num-epochs 1
+	--num-epochs 1 \
+	--predict-test True \
+	--test-file data/test.json

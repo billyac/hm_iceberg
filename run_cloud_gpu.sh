@@ -12,7 +12,8 @@ gcloud ml-engine jobs submit training $JOB_NAME \
   -- \
   --train-files $TRAIN_DATA \
   --fc-layers 512 512 256\
-  --dropouts 0.2 \
+  --dropouts 0.35 \
   --trainable-layers -1 \
   --num-epochs 150 \
-  --patience 25
+  --patience 75 \
+  --steps-per-epoch 128
