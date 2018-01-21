@@ -18,7 +18,8 @@ from keras.layers import (Activation, Add, AveragePooling2D,
                           ZeroPadding2D, concatenate)
 # from keras.layers.advanced_activations import LeakyReLU, PReLU
 # from keras.layers.merge import Concatenate
-#from keras.applications.vgg16 import VGG16
+from keras.applications.vgg16 import VGG16
+from keras.applications.vgg19 import VGG19
 #from keras.applications.inception_resnet_v2 import preprocess_input
 from keras.models import Model, Sequential, load_model
 from keras.optimizers import SGD, Adam, RMSprop, rmsprop
@@ -36,16 +37,57 @@ sess = tf.Session(config=config)
 CV_RANDOM_SEED = 42
 IMAGE_AUGMENT_SEED = 55
 
-def dispatch(train_files, learning_rate, job_dir,
-             train_batch_size=64, num_epochs=100, steps_per_epoch=15,
-             cv=1, val_ratio=0.2, # cross validation
-             decay=0.01, # learning rate decay
-             # num of epoches without improvement to trigger early stopping
+# Transfer learning models
+TRANSFER_MODELS = {
+    'InceptionResNet2': {
+        'model': InceptionResNetV2,
+        # The input width and height required, -1 means no requirement
+        'input_size': 139,
+    },
+    'VGG16': {
+        'model': VGG16,
+        # VGG16 does not require a specific input size
+        'input_size': -1,
+    },
+    'VGG19': {
+        'model': VGG19,
+        # VGG19 does not require a specific input size
+        'input_size': -1,
+    },
+}
+
+def dispatch(
+             train_files,
+             job_dir,
+             # trainning
+             learning_rate=0.001,
+             decay=0, # learning rate decay
+             train_batch_size=64,
+             steps_per_epoch=15,
+             num_epochs=100,
              patience=15,
-             fc_layers=[512], dropouts=[0.5], # fully connected layers
-             trainable_layers=166, # trainable transfer learning model layers
-             do_predict_test=False, test_file='' # predict test data
+             # cross validation
+             cv=1,
+             val_ratio=0.2,
+             # predict test data
+             do_predict_test=False,
+             test_file='',
+             # data augmentation
+             rotation_range=0,
+             horizontal_flip=False,
+             vertical_flip=False,
+             width_shift_range = 0,
+             height_shift_range = 0,
+             zoom_range = 0,
+             # transfer learning model
+             model_name='InceptionResNet2',
+             pooling='max',
+             trainable_layers=-1, # All transfer layers are trainable by default
+             # fully connected layers
+             fc_layers=[],
+             dropouts=[0],
             ):
+
     # log parameters.
     logging.info('start dispatch')
     # Preserve input parameters for saving them later
@@ -189,7 +231,7 @@ def dispatch(train_files, learning_rate, job_dir,
         # 2. predict on test set
         # 3. record prediction on trainning and validation for analysis
 
-        model = get_model(fc_layers, dropouts, trainable_layers)
+        model = get_model(fc_layers, dropouts, model_name, pooling, trainable_layers)
 
         # optimizer
         optimizer = Adam(
@@ -205,17 +247,13 @@ def dispatch(train_files, learning_rate, job_dir,
         )
 
         # data flow generator, with image data augmented.
-        # generator = ImageDataGenerator(
-        #     horizontal_flip=True,
-        #     vertical_flip=True
-        # )
         generator = ImageDataGenerator(
-            rotation_range=20,
-            horizontal_flip=True,
-            vertical_flip=True,
-            width_shift_range = 0.1,
-            height_shift_range = 0.1,
-            zoom_range = 0.1
+            rotation_range=rotation_range,
+            horizontal_flip=horizontal_flip,
+            vertical_flip=vertical_flip,
+            width_shift_range = width_shift_range,
+            height_shift_range = height_shift_range,
+            zoom_range = zoom_range
         )
 
         gen_flow = gen_flow_for_two_inputs(
@@ -353,31 +391,43 @@ def save_submit(test_id, preds, save_path):
     submission.to_csv(save_path, index=False)
 
 
-def get_model(fc_layers, dropouts, trainable_layers=166):
+def get_model(fc_layers, dropouts, model_name, pooling='avg', trainable_layers=-1):
     # dropouts either has the same size of fc_layers or has length 1 (dropout
     # ratio of all fc layers are the same in this case).
     assert len(dropouts) == 1 or len(fc_layers) == len(dropouts)
-    # input layers
+
+    # Input layers
     input_image = Input(shape=(75, 75, 2), name="image")
     input_angle = Input(shape=[1], name="angle")
 
     # convert image layer to 3 channels and proper size so that it is compatible
     # the input of the transfer learning model.
     image_layer = Conv2D(filters=3, kernel_size=1, padding='same')(input_image)
-    image_layer = ZeroPadding2D(padding=(32, 32))(image_layer)
 
-    # transfer learning model
-    transfer_model = InceptionResNetV2(
+    # Add transfer learning model layers
+    transfer_model_dict = TRANSFER_MODELS[model_name]
+    transfer_model_constructor = transfer_model_dict['model']
+    input_size = transfer_model_dict['input_size']
+    # add padding to the image layer to make it compatible with the transfer
+    # model's input
+    if input_size != -1 and input_size != 75:
+        # TODO: handle the case where input_size is less than 75
+        pad = (input_size - 75) / 2
+        image_layer = ZeroPadding2D(padding=(pad, input_size-75-pad))(image_layer)
+
+    if input_size == -1:
+        # Model with flexible input shape
+        input_shape = None
+    else:
+        input_shape = (input_size, input_size, 3)
+
+    # create transfer learning model
+    transfer_model = transfer_model_constructor(
         weights='imagenet',
-        include_top=False,
-        input_shape=(139, 139, 3),
-        pooling='avg')
-    # freeze the transfer learning model layers except last layers, default to
-    # last 166 layers for InceptionResNetV2.
-    # the last 166 layers includes 10x block8 (Inception-ResNet-C block) of size
-    # 8 x 8 x 2080 and one final convolution block of size 8 x 8 x 1536
-    # When we make the transfer model a parameter, default trainable layers need
-    # to be removed.
+        include_top=False, # do not include the original fully connect layers
+        input_shape=input_shape,
+        pooling=pooling)
+    # freeze the transfer learning model layers except the given last layers.
     if trainable_layers < 0:
         frozen_layers = []
     elif trainable_layers == 0:
@@ -386,6 +436,7 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
         frozen_layers = transfer_model.layers[:-trainable_layers]
     for layer in frozen_layers:
         layer.trainable = False
+
     # attach image layers to the input of the transfer model
     transfer_model = transfer_model(image_layer)
 
@@ -393,7 +444,7 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
     merged_model = concatenate([transfer_model, input_angle])
     # merged_model = transfer_model
 
-    # fully connected layers
+    # Fully connected layers
     if len(dropouts) == 1:
         dropouts = dropouts * len(fc_layers)
     for i, (fc_layer, dropout) in enumerate(zip(fc_layers, dropouts)):
@@ -403,7 +454,7 @@ def get_model(fc_layers, dropouts, trainable_layers=166):
             merged_model = Dropout(dropout)(merged_model)
     # merged_model = concatenate([merged_model, input_angle])
 
-    # prediction layer
+    # Prediction layer
     predictions = Dense(1, activation='sigmoid')(merged_model)
 
     model = Model(inputs=[input_image, input_angle], outputs=predictions)
@@ -445,36 +496,17 @@ if __name__ == '__main__':
         '--train-files',
         help='GCS or local paths to trainning data',
         nargs='+',
-        required=True)
-
-    parser.add_argument(
-        '--cv',
-        help=""" Number of folds for cross validation. """,
-        type=int,
-        default=1
+        required=True
     )
 
     parser.add_argument(
-        '--num-epochs',
-        help=""" Number of training data epochs on which to train. """,
-        type=int,
-        default=100
+        '--job-dir',
+        help='Job dir',
+        type=str,
+        default=''
     )
 
-    parser.add_argument(
-        '--steps-per-epoch',
-        help=""" Number of batches to go through per epoch. """,
-        type=int,
-        default=15
-    )
-
-    parser.add_argument(
-        '--train-batch-size',
-        help='Batch size for training steps',
-        type=int,
-        default=64
-    )
-
+    # Trainning
     parser.add_argument(
         '--learning-rate',
         help='Learning rate',
@@ -486,7 +518,28 @@ if __name__ == '__main__':
         '--decay',
         help='Learning rate decay over each epoch',
         type=float,
-        default=0.01
+        default=0
+    )
+
+    parser.add_argument(
+        '--train-batch-size',
+        help='Batch size for training steps',
+        type=int,
+        default=64
+    )
+
+    parser.add_argument(
+        '--steps-per-epoch',
+        help=""" Number of batches to go through per epoch. """,
+        type=int,
+        default=15
+    )
+
+    parser.add_argument(
+        '--num-epochs',
+        help=""" Number of training data epochs on which to train. """,
+        type=int,
+        default=100
     )
 
     parser.add_argument(
@@ -496,6 +549,104 @@ if __name__ == '__main__':
         default=15
     )
 
+    # Cross validation
+    parser.add_argument(
+        '--cv',
+        help=""" Number of folds for cross validation. """,
+        type=int,
+        default=1
+    )
+
+    parser.add_argument(
+        '--val-ratio',
+        help=""" Percent of trainning data to use for validation. """,
+        type=float,
+        default=0.2
+    )
+
+    # Testing data
+    parser.add_argument(
+        '--do-predict-test',
+        help='Whether predicting on test data or not',
+        type=bool,
+        default=False
+    )
+
+    parser.add_argument(
+        '--test-file',
+        help='GCS or local path to test data',
+        type=str,
+        default=''
+    )
+
+    # Data augmentation flags
+    parser.add_argument(
+        '--rotation-range',
+        help='The maximum angle to randomnly rotate the image.',
+        type=int,
+        default=0
+    )
+
+    parser.add_argument(
+        '--horizontal-flip',
+        help='Whether randomnly flip the left and right of the image or not',
+        type=bool,
+        default=False
+    )
+
+    parser.add_argument(
+        '--vertical-flip',
+        help='Whether randomnly flip the top and bottom of the image or not',
+        type=bool,
+        default=False
+    )
+
+    parser.add_argument(
+        '--width-shift-range',
+        help='The range to randomnly shift image width',
+        type=float,
+        default=0
+    )
+
+    parser.add_argument(
+        '--height-shift-range',
+        help='The range to randomnly shift image height',
+        type=float,
+        default=0
+    )
+
+    parser.add_argument(
+        '--zoom-range',
+        help='The range to randomnly zoom image',
+        type=float,
+        default=0
+    )
+
+    # Transfer learning model
+    parser.add_argument(
+        '--model-name',
+        help="""
+                The name of the transfer learning model to use, currently
+                support:
+                1. 'InceptionResNetV2',
+                2. 'VGG16',
+                3. 'VGG19'
+            """,
+        type=str,
+        required=True
+    )
+
+    parser.add_argument(
+        '--pooling',
+        help="""
+                The final pooling layer the transfer model use, can be 'avg' or
+                'max'.
+             """,
+        type=str,
+        default='max'
+    )
+
+    # Fully connected layers
     parser.add_argument(
         '--fc-layers',
         help='''
@@ -505,7 +656,7 @@ if __name__ == '__main__':
         ''',
         type=int,
         nargs='*', # accept arbitrary numbers of input
-        default=[512]
+        default=[]
     )
 
     parser.add_argument(
@@ -519,7 +670,7 @@ if __name__ == '__main__':
         ''',
         type=float,
         nargs='*', # accept arbitrary numbers of input
-        default=[0.5] # default dropout for all fully connected layers
+        default=[0] # default dropout for all fully connected layers
     )
 
     parser.add_argument(
@@ -531,30 +682,9 @@ if __name__ == '__main__':
             frozen; -1 (actually < 0) means all layers are trainable.
         ''',
         type=int,
-        default=166 # default to all layers in transfer learning model are frozen
+        # default to all layers in transfer learning model are trainable
+        default=-1
     )
-
-    parser.add_argument(
-        '--test-file',
-        help='GCS or local path to test data',
-        type=str,
-        default=''
-    )
-
-    parser.add_argument(
-        '--do-predict-test',
-        help='Whether predicting on test data or not',
-        type=bool,
-        default=False
-    )
-
-    parser.add_argument(
-        '--job-dir',
-        help='Job dir',
-        type=str,
-        default=''
-    )
-
 
     # parse command line arguments
     args = parser.parse_args()
